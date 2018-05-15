@@ -1,0 +1,510 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Testi, kuidas leida random kohast Eestis lähima tee kaugus. Selleks saab kasutada osrmr paketti.
+Lisaks testi kuidas leida lühim teekond suvalisest punktist teise suvalisse punkti (a-la google maps api). Selleks kasuta dodgr paketti, mis vimaldab arvutusi teha lokaalselt. Eesmärk on leida hooned Eestis, millest on kõige kaugemal lähim bussipeatus, pood, vms.
+
+```{r}
+library(osrmr)
+library(sf)
+library(tidyverse)
+library(mapview)
+library(raster)  # eesti maakondade kaartide pärimiseks
+library(rmapshaper)
+library(osmdata)
+library(leaflet)
+library(dodgr)
+
+
+# Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+# Eesti kaardivõrgustik 2 km2 ruutudega Maaameti kodulehelt. Selle abil saab pärida random punkte Eestis ja siis vastavatesse ruutudesse sisse zoomida.
+kaardivorgustik <- st_read("data/kaardivorgustik/epk2T.shp")
+
+# Eesti maakondade piiride kaart Maaameti kodulehelt.
+# Selle abil saab piirata Eestist väljas olevaid teid ja pärida OSM andmed teede kohta maakondade kaupa, et päringud läbi käiksid
+maakonnad <- st_read("data/maakonnad/maakond_20180501.shp")
+
+# Kõik Eesti teed OSM kaardil. 
+# Esialgu pole seda vaja
+# teed <- st_read("data/eesti_teed/gis.osm_roads_free_1.shp")
+```
+
+```{r}
+
+# lihtsusta eesti maakondade piiri kaart
+# ms_simplify on parem kui st_simplify, kuna see täidab paremini polügonide vahelised tühimikud ära
+# vt siit: https://geocompr.robinlovelace.net/transform.html#simplification
+maakonnad_simp = ms_simplify(maakonnad,
+                             keep = 0.01,  # mitu % punktidest jääb alles
+                             keep_shapes = TRUE)
+
+mapview(maakonnad_simp)
+```
+
+
+```{r}
+e <- kaardivorgustik %>% 
+  sample_n(100) %>%
+  st_centroid() %>% 
+  st_transform(crs = 4326) %>% 
+  sfc_as_cols()
+```
+
+
+```{r}
+# leia ruut ümber buffri, et sell järgi laadida alla teedevõrgustiku andmed
+asukoht_grid <- st_make_grid(st_union(maakonnad_simp), n = 1)
+
+eesti <- st_union(maakonnad_simp)
+
+mapview(eesti)
+
+# leia buffrit ümbritseva ruudu nurkade koordinaadid
+# nende abil pärin OSM kaardiandmed.
+# muuda koordinaatsüsteemi, et tulemus oleks lat/long formaadis
+asukoht_grid_bbox <- as.vector(st_bbox(st_transform(asukoht_grid, crs = 4326)))
+
+# koosta OSM päring valitud ruudu kohta
+teede_paring <- opq(bbox = asukoht_grid_bbox)
+
+# päringus ainult teedevõrgustik
+teede_paring <- add_osm_feature(teede_paring, key = 'highway')
+
+# päri teede andmed
+teed_raw <- osmdata_sf(teede_paring)
+```
+
+
+
+```{r}
+nearest(lat = 59.390107, lng = 24.674398, api_version = 5, localhost = FALSE)
+```
+
+```{r}
+mapview(head(kaardivorgustik, 10000), canvas = TRUE)
+
+?mapview
+```
+
+
+```{r}
+sfc_as_cols <- function(x, names = c("x","y")) {
+  stopifnot(inherits(x,"sf") && inherits(sf::st_geometry(x),"sfc_POINT"))
+  ret <- sf::st_coordinates(x)
+  ret <- tibble::as_tibble(ret)
+  stopifnot(length(names) == ncol(ret))
+  x <- x[ , !names(x) %in% names]
+  ret <- setNames(ret,names)
+  dplyr::bind_cols(x,ret)
+}
+```
+
+
+```{r}
+set.seed(10)
+kaardivorgustik_centroid <- kaardivorgustik %>% 
+  sample_n(100) %>%
+  st_centroid() %>% 
+  st_transform(crs = 4326) %>%
+  sfc_as_cols() %>% 
+  st_transform(crs = st_crs(maakonnad_simp))
+  
+mapview(kaardivorgustik_centroid, canvas = TRUE)
+```
+
+```{r}
+centroid_mandril <- st_intersection(kaardivorgustik_centroid, maakonnad_simp)
+
+mapview(centroid_mandril)
+```
+
+```{r}
+leia_lahima_tee_koord <- function(x, y){
+  nearest(x, y, api_version = 5, localhost = FALSE) %>% 
+    mutate(punkti_lng = x, 
+           punkti_lat = y) %>% 
+    rename(tee_lat = lat,
+           tee_lng = lng)
+}
+
+leia_lahima_tee_koord_possibly <- possibly(leia_lahima_tee_koord, NULL)
+```
+
+```{r}
+system.time(
+  punktid_lahima_tee_koordinaatidega <- map2_df(centroid_mandril$y, 
+                                                centroid_mandril$x, 
+                                                leia_lahima_tee_koord_possibly) %>% 
+    st_as_sf(coords = c("tee_lng", "tee_lat"), crs = 4326) %>% 
+    st_transform(crs = st_crs(maakonnad_simp))
+)
+```
+
+```{r}
+punkti_tee_vahemaa <- st_distance(punktid_lahima_tee_koordinaatidega, 
+                                  centroid_mandril, 
+                                  by_element = TRUE)
+```
+
+```{r}
+top_5_kaugeimat <- centroid_mandril %>% 
+  mutate(vahemaa_teest = punkti_tee_vahemaa) %>% 
+  arrange(desc(vahemaa_teest)) %>% 
+  head(5) %>% 
+  as_tibble() %>% 
+  pull(NR)
+```
+
+```{r}
+top_5_ruutu <- kaardivorgustik %>% 
+  filter(NR %in% top_5_kaugeimat) 
+
+leia_kaugeim_punkt <- function(x){
+  koordinaadid_raw <- st_make_grid(top_5_ruutu[x, ], n = 5) %>% 
+    st_centroid() 
+  
+  koordinaadid <- koordinaadid_raw %>% 
+    st_transform(crs = 4326) %>%
+    st_coordinates() %>% 
+    as.tibble() 
+  
+  koordinaadid_molemad <- map2_df(koordinaadid$Y, 
+                                  koordinaadid$X, 
+                                  leia_lahima_tee_koord_possibly) %>% 
+    st_as_sf(coords = c("tee_lng", "tee_lat"), crs = 4326) %>% 
+    st_transform(crs = st_crs(maakonnad_simp))
+  
+  punkti_tee_vahemaa_2 <- st_distance(koordinaadid_molemad, 
+                                      koordinaadid_raw, 
+                                      by_element = TRUE)
+  
+  top <- koordinaadid %>% 
+    mutate(vahemaa = punkti_tee_vahemaa_2) %>% 
+    top_n(1, vahemaa)
+    # st_as_sf(coords = c("X", "Y"), crs = 4326) %>% 
+    # st_transform(crs = 4326)
+  
+  return(top)
+}
+
+
+kaugeimad <- map_df(seq(1, 5), leia_kaugeim_punkt) %>% 
+  st_as_sf(coords = c("X", "Y"), crs = 4326)
+
+leaflet(kaugeimad %>% 
+          mutate(label = as.numeric(vahemaa))) %>% 
+  addTiles() %>% 
+  addCircles(radius = ~vahemaa) %>%
+  addCircles(color = "red")
+```
+
+
+
+```{r}
+nearest(centroid_mandril$y[5], centroid_mandril$x[5], api_version = 5, localhost = FALSE)
+```
+
+
+```{r}
+e_2 <- map2_df(e$y, e$x, nearest, api_version = 5, localhost = FALSE)
+```
+
+
+```{r}
+e[23,]
+```
+
+
+
+```{r}
+p <- st_centroid(head(kaardivorgustik, 100))
+
+mapview(p)
+
+?st_sim
+```
+
+```{r}
+sfc_as_cols <- function(x, names = c("x","y")) {
+  stopifnot(inherits(x,"sf") && inherits(sf::st_geometry(x),"sfc_POINT"))
+  ret <- sf::st_coordinates(x)
+  ret <- tibble::as_tibble(ret)
+  stopifnot(length(names) == ncol(ret))
+  x <- x[ , !names(x) %in% names]
+  ret <- setNames(ret,names)
+  dplyr::bind_cols(x,ret)
+}
+```
+
+
+```{r}
+sfc_as_cols(p)
+```
+
+
+```{r}
+gridiks <- st_make_grid(aadressregister_optika_haaletusega_sf, n = c(40, 30)) %>% 
+  st_sf() %>% 
+  st_as_sf() %>% 
+  mutate(id = row_number())
+
+?st_make_grid
+?st_centroid
+```
+
+
+
+```{r}
+st_intersection(e_est, est_shp_sf)
+```
+
+```{r}
+library(dodgr)
+```
+
+```{r}
+library (osmdata)
+
+  asukoht_grid <- st_make_grid(asukoht_buffer, n = 1)
+  
+  # leia buffrit ümbritseva ruudu nurkade koordinaadid
+  # nende abil pärin OSM kaardiandmed.
+  # muuda koordinaatsüsteemi, et tulemus oleks lat/long formaadis
+  asukoht_grid_bbox <- as.vector(st_bbox(st_transform(asukoht_grid, crs = 4326)))
+  
+  # koosta OSM päring valitud ruudu kohta
+  teede_paring <- opq(bbox = est_shp_sf)
+  
+  simp <- st_simplify(est_shp_sf, dTolerance = 300)
+  mapview(simp)
+  
+  ?st_simplify
+  
+  
+  s <- st_union(est_shp_sf)
+  mapview(st_simplify(s, dTolerance = 10))
+  
+  pmap(est_shp_sf[1,], st_simplify, dTolerance = 500)
+  
+  # päringus ainult teedevõrgustik
+  teede_paring <- add_osm_feature(teede_paring, key = 'highway')
+
+net <- osmdata::opq (bp [[1]]) %>%
+    osmdata::add_osm_feature (key = "highway") %>%
+    osmdata::osmdata_sf (quiet = FALSE) %>%
+    osmdata::osm_poly2line () %>%
+    osmdata::trim_osmdata (bp [[1]])
+
+?opq
+
+?getbb
+```
+
+
+```{r}
+bound <- st_coordinates(st_transform(maakonnad_simp %>% filter(MNIMI == "Rapla maakond"), crs = 4326)) %>%
+  as.tibble() %>% 
+  dplyr::select('1' = X, '2' = Y) %>% 
+  as.matrix()
+```
+
+```{r}
+laanemaa <- osmdata::opq (bound) %>%
+    osmdata::add_osm_feature (key = "highway") %>%
+    osmdata::osmdata_sf (quiet = FALSE) %>%
+    osmdata::osm_poly2line () %>% 
+  .$osm_lines
+
+raplpamaa <- osmdata::opq (bound) %>%
+    osmdata::add_osm_feature (key = "highway") %>%
+    osmdata::osmdata_sf (quiet = FALSE) %>%
+    osmdata::osm_poly2line () %>% 
+  .$osm_lines
+
+
+kokku <- st_union(laanemaa, raplpamaa)
+```
+
+```{r}
+library (dodgr)
+net2 <- dodgr_streetnet ("Harjumaa Estonia")
+mapview(net2)
+
+?dodgr_streetnet
+```
+
+```{r}
+net_walk <- weight_streetnet (net2, wt_profile = "foot")
+```
+
+```{r}
+p_foot <- dodgr_paths(net_walk, from = c(23.548856, 58.941499), to = c(23.536168, 58.947809))
+```
+
+```{r}
+verts <- dodgr_vertices (net_walk)
+```
+
+```{r}
+index <- match (p_foot [[1]] [[1]], verts$id)
+p_foot <- verts [index, ]
+```
+
+```{r}
+p_foot <- p_foot [, c ("x", "y")] %>%
+    as.matrix () %>%
+    sf::st_linestring () %>%
+    sf::st_sfc ()
+sf::st_crs (p_foot) <- 4326
+```
+
+```{r}
+mapview (p_foot)
+```
+
+```{r}
+metsa <- ggmap::geocode("metsa 38 haapsalu")
+
+oismae <- ggmap::geocode("mai 8 tallinn")
+
+ter <- ggmap::geocode("vilmsi 43 tallinn")
+
+asukohad <- bind_rows(metsa, ilon, ter) %>% 
+  as.matrix()
+```
+
+```{r}
+weight_streetnet (teed)
+```
+
+
+
+```{r}
+teed_weight <- weight_streetnet (teed, wt_profile = "motorcar")
+p_bike <- dodgr_paths (net_bike, from = asukohad, to = asukohad)
+verts <- dodgr_vertices (net_bike)
+index <- match (p_bike [[1]] [[1]], verts$id)
+p_bike <- verts [index, ]
+p_bike <- p_bike [, c ("x", "y")] %>%
+    as.matrix () %>%
+    sf::st_linestring () %>%
+    sf::st_sfc ()
+sf::st_crs (p_bike) <- 4326 # OSM CRS
+mapview (p_bike)
+```
+
+```{r}
+net2
+```
+
+```{r}
+teekond <- viaroute(lat1 = metsa$lat, lng1 = metsa$lon, lat2 = oismae$lat, lng2 = oismae$lon, instructions = TRUE,
+         api_version = 5, localhost = FALSE)
+```
+
+
+```{r}
+p <- st_make_grid(maakonnad_simp, n = 10)
+t <- st_intersection(p, st_union(maakonnad_simp))
+mapView(t)
+```
+
+```{r}
+esimene <- t %>% 
+  as.tibble() %>% 
+  filter(row_number() %in% c(53)) %>% 
+  st_as_sf() %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble() %>% 
+  dplyr::select('1' = X, '2' = Y) %>% 
+  as.matrix()
+
+teine <- t %>% 
+  as.tibble() %>% 
+  filter(row_number() %in% c(54)) %>% 
+  st_as_sf() %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble() %>% 
+  dplyr::select('1' = X, '2' = Y) %>% 
+  as.matrix()
+```
+
+
+```{r}
+esimene_kaart <- osmdata::opq (esimene) %>%
+    osmdata::add_osm_feature (key = "highway") %>%
+    osmdata::osmdata_sf (quiet = FALSE) %>%
+    osmdata::osm_poly2line () %>% 
+  .$osm_lines
+
+teine_kaart <- osmdata::opq (teine) %>%
+    osmdata::add_osm_feature (key = "highway") %>%
+    osmdata::osmdata_sf (quiet = FALSE) %>%
+    osmdata::osm_poly2line () %>% 
+  .$osm_lines
+```
+
+
+```{r}
+mapview(esimene_kaart) %>% 
+  addFeatures(teine_kaart, color = "red")
+```
+
+```{r}
+mapview(teine_kaart)
+```
+
+```{r}
+pealk <- subset(names(esimene_kaart), names(esimene_kaart) %in% names(teine_kaart))
+
+esimene_kaart_toodeldud <- esimene_kaart %>% 
+  dplyr::select(pealk)
+
+teine_kaart_toodeldud <- teine_kaart %>% 
+  dplyr::select(pealk)
+```
+
+```{r}
+esimene_teine <- esimene_kaart_toodeldud %>% 
+  as.tibble() %>% 
+  bind_rows(teine_kaart_toodeldud %>% as.tibble()) %>% 
+  distinct(osm_id, .keep_all = TRUE) %>% 
+  st_as_sf(crs = 4326) %>% 
+  st_transform(crs = 4326)
+
+mapview(esimene_teine)
+```
+
+
+```{r}
+kuhu <- tibble(to_y = c(58.969762, 58.910595, 59.008616),
+               to_x = c(25.538843, 25.592108, 24.885721))
+
+kust <- tibble(from_y = c(58.969762),
+               from_x = c(25.538843))
+
+teed_weight <- weight_streetnet (esimene_teine, wt_profile = "motorcar")
+p_bike <- dodgr_paths (teed_weight, from = kust, 
+                       to = kuhu)
+verts <- dodgr_vertices (teed_weight)
+index <- match (p_bike [[1]] [[3]], verts$id)
+p_bike <- verts [index, ]
+p_bike <- p_bike [, c ("x", "y")] %>%
+    as.matrix () %>%
+    sf::st_linestring () %>%
+    sf::st_sfc ()
+sf::st_crs (p_bike) <- 4326 # OSM CRS
+mapview (p_bike)
+
+system.time(
+dodgr_dists(teed_weight, from = kust, 
+                       to = kuhu)
+)
+```
+

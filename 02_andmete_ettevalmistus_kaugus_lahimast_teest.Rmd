@@ -1,0 +1,350 @@
+---
+title: "Kaugeim punkt teedest - andmete ettevalmistus"
+output: html_notebook
+---
+
+Valmista ette andmed, et leida Eestis punktid, millest on sõidutee kõige kaugemal.
+
+```{r setup}
+library(osrmr)
+library(sf)
+library(tidyverse)
+library(mapview)
+# library(rmapshaper)
+library(osmdata)
+library(leaflet)
+library(dbscan)
+
+
+# Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+# Eesti kaardivõrgustik 2 km2 ruutudega Maaameti kodulehelt. Selle abil saab pärida random punkte Eestis ja siis vastavatesse ruutudesse sisse zoomida.
+kaardivorgustik_raw <- st_read("data/kaardivorgustik/epk2T.shp")
+
+# Eesti maakondade piiride kaart Maaameti kodulehelt.
+# Selle abil saab piirata Eesti mandriosast väljas olevaid kaardiruute
+maakonnad_raw <- st_read("data/maakonnad/maakond_20180501.shp")
+```
+
+Lihtsustamine on välja kommenteeritud kuna ma ei installinud ajutisse AWS serverisse rmapshaper paketti, mis on vajalik lihtsustatud kaardi tekitamiseks.
+```{r}
+# # lihtsusta eesti maakondade piiri kaart
+# # ms_simplify on parem kui st_simplify, kuna see täidab paremini polügonide vahelised tühimikud ära
+# # vt siit: https://geocompr.robinlovelace.net/transform.html#simplification
+# maakonnad_simp_raw = ms_simplify(maakonnad_raw,
+#                              keep = 0.01,  # mitu % punktidest jääb alles
+#                              keep_shapes = TRUE)
+# 
+# mapview(maakonnad_simp_raw)
+```
+
+Salvesta lihtsustatud maakondade piirid
+```{r}
+# saveRDS(maakonnad_simp_raw, file = "data/maakonnad_simp.RDS")
+```
+
+Lae lihtsustatud maakondade piirid
+```{r}
+maakonnad_simp_raw <- readRDS("data/maakonnad_simp.RDS")
+```
+
+Jäta maakondade piiridest välja väiksed saared.
+See on vajalik, et mitte tuvastada teest kaugete punktidena saartel asuvaid kohti.
+```{r}
+# eraldia multipolygon eraldi polygon-ideks, st iga polügon on eraldi rida tabelis 
+maakonnad_polygon_raw <- st_cast(maakonnad_simp_raw, "POLYGON") 
+
+# iga polügoni suurus m2
+maakonnad_polygon_m2 <- st_area(maakonnad_polygon_raw)
+
+# jäta alles ainult üle 1000km2 polügonid
+maakonnad_simp <- maakonnad_polygon_raw %>% 
+  mutate(ala_km2 = round(as.numeric(maakonnad_polygon_m2) / 1000000, 1)) %>% 
+  filter(ala_km2 > 1000)
+
+mapview(maakonnad_simp)
+```
+
+
+Prindi random 100 ruutu Eesti kaardivõrgustikult
+```{r}
+set.seed(100)
+
+kaardivorgustik_raw %>% 
+  sample_n(100) %>% 
+  mapview()
+```
+
+Funktsioon, mis lisab lat ja lon koordinaadid sf objeltil eraldfi vergudesse
+```{r}
+sfc_as_cols <- function(x, names = c("x","y")) {
+  stopifnot(inherits(x,"sf") && inherits(sf::st_geometry(x),"sfc_POINT"))
+  ret <- sf::st_coordinates(x)
+  ret <- tibble::as_tibble(ret)
+  stopifnot(length(names) == ncol(ret))
+  x <- x[ , !names(x) %in% names]
+  ret <- setNames(ret,names)
+  dplyr::bind_cols(x,ret)
+}
+```
+
+Leia kaardivõrgustiku ruutude keskpunktid ja kanna need kaardile.
+Nende põhjal hakkan leidma lähimate teede kauguseid.
+```{r}
+kaardivorgustik_centroid <- kaardivorgustik_raw %>% 
+  # sample_n(100) %>%
+  st_centroid() %>%  # leia ruudu keskpunkt
+  st_transform(crs = 4326) %>%  # muuda projektsioon
+  sfc_as_cols() %>%  # lisa veerud lat ja lon koordinaatidega
+  st_transform(crs = st_crs(kaardivorgustik_raw))  # muuda projektsioon algseks tagasi
+
+set.seed(100)  
+mapview(sample_n(kaardivorgustik_centroid, 1000), canvas = TRUE)
+```
+
+Jäta alles ainult need kaardiruutude keskmised punktid, mis asuvad mandril või suurematel saartel.
+```{r}
+centroid_mandril <- st_intersection(kaardivorgustik_centroid, maakonnad_simp)
+
+set.seed(100)
+mapview(sample_n(centroid_mandril, 1000))
+```
+
+
+Funktsioon, mis leiab läbi osrmr API valitud lat ja lon koordinaatidele lähima tee koordinaadid ja lisab need 
+```{r}
+leia_lahima_tee_koord <- function(x, y){
+  # tee paus, et API-t mitte üle koormata
+  Sys.sleep(runif(n = 1, min = 1, max = 3))
+  
+  osrmr::nearest(x, y, api_version = 5, localhost = FALSE) %>% 
+    mutate(punkti_lng = y, 
+           punkti_lat = x) %>% 
+    rename(tee_lat = lat,
+           tee_lng = lng)
+}
+
+# anna NULL väärtus, kui tuleb viga
+leia_lahima_tee_koord_possibly <- possibly(leia_lahima_tee_koord, NULL)
+```
+
+Päri kõigi ruutude keskpunkti kohta lähima tee koordinaadid
+Selleks kasutatud OSRM avalik API ei oli üsna tihti kättesaadav, seetõttu on mõistlik töö ära teha lokaalse OSRM serveri peal
+```{r}
+# punktid_lahima_tee_koordinaatidega_raw <- map2_df(centroid_mandril$y, 
+#                                                   centroid_mandril$x, 
+#                                                   leia_lahima_tee_koord_possibly)
+# 
+# punktid_lahima_tee_koordinaatidega_raw
+```
+
+Salvesta toorandmed kõigi ruutude keskpunkti lähima tee koordinaatidega.
+```{r}
+# saveRDS(punktid_lahima_tee_koordinaatidega_raw, file = "data/punktid_lahima_tee_koordinaatidega.RDS")
+```
+
+Lae toorandmed kõigi ruutude keskpunkti lähima tee koordinaatidega.
+```{r}
+punktid_lahima_tee_koordinaatidega_raw <- readRDS(file = "data/punktid_lahima_tee_koordinaatidega.RDS")
+```
+
+Jäta alles ainult need lähima tee koordinaadid, mis asuvad mandril või suurematel saartel.
+Välistatud on kõik väiksemad saared.
+```{r}
+punktid_lahima_tee_koordinaatidega_raw <- st_intersection(punktid_lahima_tee_koordinaatidega_raw %>% 
+                                                            st_as_sf(coords = c("punkti_lng", "punkti_lat"),
+                                                                     crs = 4326, remove = FALSE) %>% 
+                                                            st_transform(crs = st_crs(maakonnad_simp)), 
+                                                          maakonnad_simp) %>% 
+  as.tibble() %>% 
+  select(tee_lat, tee_lng, punkti_lng, punkti_lat)
+```
+
+
+Tee kaks eraldi SF objekti kõigi ruutude keskpunktidega ja igale punktile vastava tee koordinaatidega.
+```{r}
+ruutude_centroid_sf <- punktid_lahima_tee_koordinaatidega_raw %>%
+  st_as_sf(coords = c("punkti_lng", "punkti_lat"), 
+           crs = 4326, remove = FALSE) %>% 
+  st_transform(crs = st_crs(maakonnad_simp))
+
+ruutude_lahim_tee_sf <- punktid_lahima_tee_koordinaatidega_raw %>%
+  st_as_sf(coords = c("tee_lng", "tee_lat"), 
+           crs = 4326, remove = FALSE) %>% 
+  st_transform(crs = st_crs(maakonnad_simp))
+```
+
+
+Arvuta vahemaa (meetrites) kaardivõrgustiku ruutude keskpunktide ja lähimate teede vahel linnulennult.
+```{r}
+punkti_tee_vahemaa <- st_distance(ruutude_lahim_tee_sf, 
+                                  ruutude_centroid_sf, 
+                                  by_element = TRUE)
+```
+
+Lisa punkti sf objektile vahemaa meetrites lähimast teest.
+```{r}
+centroidi_kaugus_teest <- ruutude_centroid_sf %>% 
+  mutate(kaugus_lahimast_teest = round(punkti_tee_vahemaa, 0))
+
+centroidi_kaugus_teest
+```
+
+Vaata kaardil top 200 punkti, millest tee on kõige kaugemal.
+```{r}
+centroidi_kaugus_teest %>% 
+  arrange(desc(kaugus_lahimast_teest)) %>% 
+  head(200) %>% 
+  mapview()
+```
+
+Leia top 1000 punkti, mis on teest kõige kaugemal. Seejärel klasterda need punktid, et tuvastada grupid, kus need punktid paiknevad. Igast grupist saan siis omakorda leida kõige kaugema punkti.
+```{r}
+kaugus_clust <- centroidi_kaugus_teest %>% 
+  arrange(desc(kaugus_lahimast_teest)) %>% 
+  head(1000) %>% 
+  as.data.frame() %>% 
+  select(punkti_lng, punkti_lat) %>% 
+  hdbscan(minPts = 5)
+```
+
+
+Grupeeri varem leitud klastrid kokku ja leia igast klastrist kõige kaugem punkt teedest.
+```{r}
+top_kaugemad_teed <- centroidi_kaugus_teest %>% 
+  arrange(desc(kaugus_lahimast_teest)) %>% 
+  head(1000) %>% 
+  mutate(cluster = kaugus_clust$cluster) %>%  # lisa klastri number (0 on ilma klastrita)
+  arrange(cluster, desc(kaugus_lahimast_teest)) %>% 
+  # anna 0 tunnusega klastritele unikaalsed nimed, et neid omavahel kokku ei klasterdaks
+  mutate(index = ifelse(cluster == 0, str_c(0, row_number(), sep = "_"), cluster)) %>% 
+  group_by(index) %>% 
+  filter(kaugus_lahimast_teest == max(kaugus_lahimast_teest)) %>% 
+  ungroup() %>% 
+  arrange(desc(kaugus_lahimast_teest))
+
+mapview(head(top_kaugemad_teed, 20), zcol = "index")
+```
+
+Kanna kaardile top 15 teest kõige kaugemat kaardivõrgustiku keskpunkti koos tee kaugus raadiuse ringiga.
+```{r}
+top_kaugemad_teed %>% 
+  head(15) %>% 
+  st_transform(crs = 4326) %>% 
+  leaflet() %>% 
+  addTiles() %>% 
+  addCircles(radius = ~kaugus_lahimast_teest) %>%
+  addCircles(color = "red")
+```
+
+```{r}
+top_kaugemad_teed
+```
+
+
+Leia top n kaugeima ruudu numbrid, et nendesse ruutudesse sisse zoomida
+```{r}
+top_kaugeima_ruudu_nr <- centroid_mandril %>% 
+  as.tibble() %>% 
+  inner_join(top_kaugemad_teed %>% 
+              as.tibble() %>% 
+              select(punkti_lng, punkti_lat, kaugus_lahimast_teest),
+            by = c("x" = "punkti_lng", "y" = "punkti_lat")) %>% 
+  pull(NR)
+```
+
+Leia kõige kaugemate kaardivõrgustiku keskpunktide kaardiruudud, et need järgmises sammus omakorda tükkideks jagada.
+```{r}
+top_n_ruutu <- kaardivorgustik_raw %>% 
+  filter(NR %in% top_kaugeima_ruudu_nr) 
+```
+
+Funktsioon, mis leiab lokaalselt läbi osrmr valitud lat ja lon koordinaatidele lähima tee koordinaadid ja lisab need 
+```{r}
+leia_lahima_tee_koord_local <- function(x, y){
+  osrmr::nearest(x, y, api_version = 5, localhost = TRUE) %>% 
+    mutate(punkti_lng = y, 
+           punkti_lat = x) %>% 
+    rename(tee_lat = lat,
+           tee_lng = lng)
+}
+
+# anna NULL väärtus, kui tuleb viga
+leia_lahima_tee_koord_local_possibly <- possibly(leia_lahima_tee_koord_local, NULL)
+```
+
+Funktsioon, mis jagab iga kaardivõrgustiku ruudu omakorda 5x5 ruuduks ja leiab nendest omakorda kõige kaugema punkti.
+```{r}
+leia_kaugeim_punkt <- function(x){
+  
+  # jaga iga kaardiruudustik omakorda 5x5 ruuduks ja leia nende keskpunktid
+  ruudu_jagatud_centroid_sf <- st_make_grid(top_n_ruutu[x, ], n = 5) %>% 
+    st_centroid() 
+  
+  # muuda sf objeks lat lon koordinaatide data frameks, mille peal leida lähimad teed
+  ruudu_jagatud_koordinaadid <- ruudu_jagatud_centroid_sf %>% 
+    st_transform(crs = 4326) %>%
+    st_coordinates() %>% 
+    as.tibble() 
+  
+  # leia igale punktile vastavad lähima tee koordinaadid sf objektina
+  lahima_tee_koordinaadid <- map2_df(ruudu_jagatud_koordinaadid$Y, 
+                                  ruudu_jagatud_koordinaadid$X, 
+                                  leia_lahima_tee_koord_local_possibly) %>% 
+    st_as_sf(coords = c("tee_lng", "tee_lat"), crs = 4326) %>% 
+    st_transform(crs = st_crs(maakonnad_simp))
+  
+  # arvuta punkti ja lahima tee vaheline linnulennuline kaugus
+  punkti_tee_vahemaa_ruudus <- st_distance(lahima_tee_koordinaadid, 
+                                           ruudu_jagatud_centroid_sf, 
+                                           by_element = TRUE)
+  
+  # jäta alles kõige kaugema punkti koordinaadid
+  kaugeim_punkt <- ruudu_jagatud_koordinaadid %>% 
+    mutate(punkti_kaugus_teest = punkti_tee_vahemaa_ruudus) %>% 
+    top_n(1, punkti_kaugus_teest)
+  
+  return(kaugeim_punkt)
+}
+```
+
+
+Seadista lokaalne OSRM server tööle
+```{r}
+Sys.setenv("OSRM_PATH" = "osrm-backend/")
+
+# Käivita terminalist osrmr MLD algoritm:
+# osrm-routed --algorithm=MLD estonia-latest.osrm 
+```
+
+Leia igast 2km2 kaardivõrgustiku ruudust teest kõige kaugem punkt
+```{r}
+kaugeimad_punktid <- map_df(seq(1, nrow(top_n_ruutu)), leia_kaugeim_punkt) %>% 
+  st_as_sf(coords = c("X", "Y"), crs = 4326, remove = FALSE)
+
+
+leaflet(kaugeimad_punktid %>% 
+          mutate(label = as.numeric(punkti_kaugus_teest))) %>% 
+  addTiles() %>% 
+  addCircles(radius = ~punkti_kaugus_teest) %>%
+  addCircles(color = "red")
+```
+
+Sulge OSRM server
+```{r}
+quit_server()
+```
+
+
+Vaata ühel kaardil maakonna piire ja kaugeimaid punkt teedest
+```{r}
+mapview(list(kaugeimad_punktid %>% 
+          st_transform(crs = st_crs(maakonnad_simp)), maakonnad_simp))
+```
+
+
+Salvesta top n punkti, mis on teedest kõige kaugemal
+```{r}
+saveRDS(kaugeimad_punktid, file = "data/kaugeimad_punktid.RDS")
+```

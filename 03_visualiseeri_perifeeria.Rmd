@@ -1,0 +1,133 @@
+---
+title: "Visualiseeri perifeeriad"
+output: html_notebook
+---
+
+Visualiseeri ca 50 punkti Eestis, mis asuvad teedest kõige kaugemal.
+
+```{r setup}
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(mapview)
+library(htmlwidgets)
+
+
+# Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+# lae punktide koordinaadid, mis asuvad teedets kõige kaugemal
+kaugeimad_punktid_raw <- readRDS("data/kaugeimad_punktid.RDS")
+
+# lae Eesti vesikonna (järved, jõed, märgalad) polügonid
+# kasutan, et tuvastada, kui palju perifeerseid punkte asub rabas
+# shp file on pärid lehelt http://download.geofabrik.de/europe/estonia.html
+vesi_sf_raw <- st_read("data/water/gis.osm_water_a_free_1.shp")
+```
+
+top 15 kaardil
+```{r}
+kaugeimad_punktid_raw %>% 
+  arrange(desc(punkti_kaugus_teest)) %>% 
+  head(15) %>% 
+  mapview()
+```
+
+Töötle vesikonna sf objekti ainult märgaladeks
+```{r}
+margalad_sf <- vesi_sf_raw %>% 
+  filter(fclass == "wetland") %>% 
+  st_transform(crs = eesti_proj4) %>% 
+  # arvuta märgala suurus km2
+  mutate(ala_km2 = as.numeric(round(st_area(.) / 1000000, 1))) %>% 
+  distinct(osm_id, .keep_all = TRUE) %>% 
+  select(osm_id, name, ala_km2, geometry)
+
+margalad_sf
+```
+
+Koosta iga punkti ümber buffer, mis on nii suur kui kaugel temast on lähim tee
+```{r}
+# punktid eesti projektsiooniga
+kaugeimad_punktid_est_proj <- kaugeimad_punktid_raw %>% 
+  st_transform(crs = eesti_proj4) %>% 
+  arrange(desc(punkti_kaugus_teest)) %>% 
+  head(20)
+
+# funktsioon, mis teeb rida haaval valitud distantsiga buffri
+tee_buffer <- function(x, y){
+  valitud_rida <- kaugeimad_punktid_est_proj[x,]
+  
+  st_buffer(valitud_rida, dist = y)
+}
+
+# tee kõigi punktide kohta buffer, mis on sama suur kui kaugus lähimast teest
+kaugeimad_punktid_buffer_raw <- map2(seq(1, nrow(kaugeimad_punktid_est_proj)), 
+                                     kaugeimad_punktid_est_proj$punkti_kaugus_teest,
+                                     tee_buffer)
+
+# muuda list üheks sf objektiks kokku
+kaugeimad_punktid_buffer <- reduce(kaugeimad_punktid_buffer_raw, rbind)
+
+mapview(kaugeimad_punktid_buffer)
+```
+
+
+Leia, millised rabad ristuvad iga punkti buffriga
+```{r}
+punktid_rabas <- st_intersection(kaugeimad_punktid_buffer, margalad_sf) %>% 
+  as.data.frame() %>% 
+  select(raba_osm_id = osm_id, X, Y, raba_nimi = name, ala_km2) %>% 
+  distinct(raba_osm_id)
+```
+
+Filtreeri välja ainult need rabad, mis langevad op 20 puntki buffri sisse.
+```{r}
+rabad <- margalad_sf %>% 
+  inner_join(punktid_rabas, by = c("osm_id" = "raba_osm_id")) %>% 
+  mutate(popup = str_c(name, " (", ala_km2, " km2)"),
+         popup = coalesce(popup, str_c(ala_km2, " km2"))) %>% 
+  st_transform(crs = st_crs(kaugeimad_punktid_raw))
+
+rabad
+```
+
+Koosta interaktiivne kaart top 20 asukohaga, mis on teedest kõige kaugemal.
+Kaardil saab valida aluskaarti ning seda, kas kuvatud on ka teevaba ala sisse jäävad rabad
+```{r}
+top_20_kaardile_data <- kaugeimad_punktid_raw %>% 
+          mutate(label = str_c("Kaugus lähimast teest: ",
+                               round(punkti_kaugus_teest / 1000, 1), " km")) %>% 
+          arrange(desc(punkti_kaugus_teest)) %>% 
+          head(20)
+
+top_20_kaardile <- leaflet(top_20_kaardile_data) %>% 
+  addTiles(group = "OSM (default)") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Esri.WorldImagery") %>%
+  addCircles(radius = ~punkti_kaugus_teest,
+             stroke = FALSE,
+             color = "red",
+             fillOpacity = 0.3) %>%
+  addCircles(color = "red",
+             label = ~label,
+             radius = 15) %>% 
+  addPolygons(data = rabad, 
+              stroke = FALSE,
+              group = "Lähimad rabad",
+              fillOpacity = 0.5,
+              popup = ~popup) %>% 
+  addLayersControl(
+    baseGroups = c("OSM (default)", "Esri.WorldImagery"),
+    overlayGroups = c("Lähimad rabad"),
+    options = layersControlOptions(collapsed = TRUE)) %>% 
+  hideGroup("Lähimad rabad") %>% 
+  setView(25.791753, 58.587786, zoom = 8)
+
+top_20_kaardile
+```
+
+
+Salvesta interaktiivne kaart blogis kasutamiseks
+```{r}
+saveWidget(top_20_kaardile, file = "perifeeria_punktid.html", selfcontained = TRUE)
+```
