@@ -121,7 +121,7 @@ top_20_kaardile <- leaflet(top_20_kaardile_data) %>%
     overlayGroups = c("Lähimad rabad"),
     options = layersControlOptions(collapsed = TRUE)) %>% 
   hideGroup("Lähimad rabad") %>% 
-  setView(25.791753, 58.587786, zoom = 8)
+  setView(25.628101, 58.911235, zoom = 8)
 
 top_20_kaardile
 ```
@@ -129,5 +129,6 @@ top_20_kaardile
 
 Salvesta interaktiivne kaart blogis kasutamiseks
 ```{r}
-saveWidget(top_20_kaardile, file = "perifeeria_punktid.html", selfcontained = TRUE)
+saveWidget(top_20_kaardile, file = "perifeeria_punktid.html", selfcontained = TRUE,
+           title = "Perifeeria")
 ```
