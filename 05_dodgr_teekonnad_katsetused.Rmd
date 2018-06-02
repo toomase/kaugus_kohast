@@ -1,0 +1,405 @@
+---
+title: "Teekondade arvutuste katsetused dodgr paketiga"
+output: html_notebook
+---
+
+Katseta dodgr paketi ja varem välja arvutatud Eesti teede kaalutud alustabeliga teepikkuse arvutamist ning teekondade joonistamist.
+
+Analüüsida võiks:
+ - kaugust igast kodust kooli
+ - kaugust igast kodust haiglasse
+ - kaugust igast kodust bussipeatusesse
+ - teha teemakaart, mis näitab kauguseid piirakonna hoonetest lähima kooli, haigla või bussipeatuseni. 
+
+```{r setup}
+library(tidyverse)
+library(sf)
+library(mapview)
+library(dodgr)
+
+# Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+# Lae motorcar põhine Eesti teede alusandmestik
+eesti_teed_motorcar_weight <- readRDS("data/eesti_teed_motorcar_weight.rds")
+
+# Lae OSM Eesti POI andmed, et nende peal katsetusi teha
+eesti_poi <- st_read("data/eesti_poi/gis.osm_pois_free_1.shp")
+
+# Kõik Eesti ühistranspordi peatused
+# Pärinevad siit: http://www.peatus.ee/gtfs/
+# Täpsem info: https://www.mnt.ee/sites/default/files/elfinder/article_files/uhistranspordiregistri_avaandmete_spec_v1_3.pdf
+stops_raw <- read_csv("data/stops.txt")
+
+# Lae lihtsustatud maakondade piirid
+maakonnad_simp_raw <- readRDS("data/maakonnad_simp.RDS")
+```
+
+
+Jäta maakondade piiridest välja väiksed saared.
+See on vajalik, et mitte tuvastada teest kaugete punktidena saartel asuvaid kohti.
+```{r}
+# eraldia multipolygon eraldi polygon-ideks, st iga polügon on eraldi rida tabelis 
+maakonnad_polygon_raw <- st_cast(maakonnad_simp_raw, "POLYGON") 
+
+# iga polügoni suurus m2
+maakonnad_polygon_m2 <- st_area(maakonnad_polygon_raw)
+
+# jäta alles ainult üle 1000km2 polügonid
+maakonnad_simp <- maakonnad_polygon_raw %>% 
+  mutate(ala_km2 = round(as.numeric(maakonnad_polygon_m2) / 1000000, 1)) %>% 
+  filter(ala_km2 > 1000)
+
+mapview(maakonnad_simp)
+```
+
+
+Tutvu Eesti POI andmetega
+```{r}
+mapview(eesti_poi)
+
+eesti_poi %>% 
+  count(fclass, sort = TRUE)
+```
+
+
+## Näidis OSM haiglate ja kinode vahelise kaugusega
+
+Tekita näidis andmed 23x21 distantsi
+```{r}
+kust_hospital_sf <- eesti_poi %>% 
+  filter(fclass == "hospital")
+
+kust_hospital <- kust_hospital_sf %>% 
+  st_coordinates() %>% 
+  as.tibble() %>% 
+  rename(from_x = X,
+         from_y = Y)
+
+
+kuhu_cinema_sf <- eesti_poi %>% 
+  filter(fclass == "cinema")
+
+kuhu_cinema <- kuhu_cinema_sf %>% 
+  st_coordinates() %>% 
+  as.tibble() %>% 
+  rename(to_x = X,
+         to_y = Y)
+```
+
+Arvuta distants kõigi kust-kuhu asukohtade kombinatsioonide vahel
+```{r}
+system.time(
+  distants_hospital_cinema <- dodgr_dists(eesti_teed_motorcar_weight, 
+                                          from = kust_hospital, 
+                                          to = kuhu_cinema)
+)
+```
+
+Leia igale haiglale lähime kino kaugus
+```{r}
+min_distants_hospital_cinema <- distants_hospital_cinema %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+
+min_distants_hospital_cinema
+```
+
+Leia lähima kino rea number, et selle järgi tuvastada juba nimi jm info
+```{r}
+lahim_kino <- distants_hospital_cinema %>% 
+  as.tibble() %>% 
+  gather() %>% 
+  filter(value %in% min_distants_hospital_cinema)
+
+lahim_kino
+```
+
+Ühes tabelis koos igale haiglale lähima kino id ja vahemaa
+```{r}
+min_distants_hospital_cinema %>% 
+  as.tibble() %>% 
+  mutate(kust_id = row_number()) %>% 
+  left_join(lahim_kino %>% mutate(key = as.numeric(key)), by = c("value")) %>% 
+  rename(kuhu_id = key,
+         vahemaa = value) %>% 
+  left_join(kust_hospital_sf %>% 
+              as.tibble() %>% 
+              select(kust_nimi = name) %>% 
+              mutate(kust_id = row_number())) %>% 
+  left_join(kuhu_cinema_sf %>% 
+              as.tibble() %>% 
+              select(kuhu_nimi = name) %>% 
+              mutate(kuhu_id = row_number()))
+```
+
+Kanna kaardile teekond mõnest haiglast lähima kinoni
+```{r}
+path_hospital_cinema <- dodgr_paths(eesti_teed_motorcar_weight,
+                                    from = kust_hospital %>% filter(row_number() == 12), 
+                                    to = kuhu_cinema %>% filter(row_number() == 19))
+
+verts <- dodgr_vertices(eesti_teed_motorcar_weight)
+
+index <- match(path_hospital_cinema[[1]][[1]], verts$id)
+
+path_hospital_cinema_valik <- verts[index, ]
+
+path_hospital_cinema_sf <- path_hospital_cinema_valik %>%
+  select(x, y) %>% 
+  as.matrix() %>%
+  st_linestring() %>%
+  st_sfc(crs = 4326)
+
+mapview(path_hospital_cinema_sf) %>% 
+  addFeatures(kust_hospital_sf %>% filter(row_number() == 12), color = "blue") %>% 
+  addFeatures(kuhu_cinema_sf %>% filter(row_number() == 19), color = "red")
+```
+
+
+## Tallinna majade kaugus bussipeatustest
+
+Klasterda Eesti ühistranspordi peatused 1000 klastriks ning jäta igast klastrist alles üks peatus.
+```{r}
+clust <- stops_raw %>%
+  select(stop_lat, stop_lon) %>% 
+  kmeans(centers = 1000) %>% 
+  .$cluster
+
+stops_sf <- stops_raw %>% 
+  mutate(cluster = clust) %>% 
+  st_as_sf(coords = c("stop_lon", "stop_lat"), crs = 4326) %>% 
+  st_transform(crs = st_crs(maakonnad_simp))
+
+stops_eesti_sf <- st_intersection(stops_sf, maakonnad_simp)
+
+# Jäta igast klastrist alles üks peatus
+stops_piiratud <- stops_eesti_sf %>% 
+  arrange(cluster, stop_id) %>% 
+  distinct(cluster, .keep_all = TRUE)
+
+mapview(stops_piiratud)
+```
+
+Koosta Tallinna ümber 15km buffer, et selle abil piirata peatused, teed ja majad ja leida maja, millest on lähim peatus kõige kaugemal.
+```{r}
+tallinn_buffer <- stops_eesti_sf %>% 
+  filter(stop_name == "Hobujaama") %>% 
+  head(1) %>% 
+  st_buffer(dist = 15000)
+
+tallinn_buffer %>% 
+  mapview()
+```
+
+Klasterda Tallinna ja lähiümbruse peatused 500 klastrisse ja jäta igats grupist alles üks peatus.
+See võimaldab vähendada distantsi otsimise mahtu.
+```{r}
+tallinn_peatused <- st_intersection(stops_eesti_sf, tallinn_buffer)
+
+clust_tallinn <- tallinn_peatused %>%
+  as.data.frame() %>% 
+  select(lest_x, lest_y) %>% 
+  kmeans(centers = 500) %>% 
+  .$cluster
+
+tallinn_piiratud <- tallinn_peatused %>% 
+  mutate(cluster = clust_tallinn) %>% 
+  arrange(cluster, stop_id) %>% 
+  distinct(cluster, .keep_all = TRUE)
+
+mapview(tallinn_piiratud)
+```
+
+Lae andmed Tallinna hoonete kohta
+Põhined projektil "hoonete_vanus"
+```{r}
+load("data/majad_tallinnas_vanusega.RData")
+
+majad_tallinnas_vanusega %>% 
+  mapview()
+```
+
+Vali random 1000 maja Tallinnas, et neist bussipeatusest kõige kaugemad leida
+```{r}
+set.seed(1000)
+
+majad_tallinnas_1000 <- majad_tallinnas_vanusega %>% 
+  sample_n(1000) %>% 
+  st_centroid()
+```
+
+Lae Eesti teede sf objekt, kust ebavajalikud veerud on eemaldatud
+```{r}
+eesti_teed_vaiksem_sf <- readRDS("data/eesti_teed_vaiksem_sf.rds")
+```
+
+Koosta Tallinna teede kohta jalgsi kaalutud dodgr tabel
+```{r}
+tallinna_teed <- st_intersects(eesti_teed_vaiksem_sf %>% st_transform(crs = st_crs(tallinn_buffer)), 
+                               tallinn_buffer)
+
+tallinna_teede_inex <- tallinna_teed %>% 
+  as.matrix() %>% 
+  as.tibble() %>% 
+  mutate(index = row_number()) %>% 
+  filter(V1 == TRUE) %>% 
+  pull(index)
+
+tallinna_teed_sf <- eesti_teed_vaiksem_sf %>% 
+  filter(row_number() %in% tallinna_teede_inex)
+
+tallinna_teed_foot_weight <- weight_streetnet(eesti_teed_vaiksem_sf, wt_profile = "foot")
+```
+
+Muuda Tallinna 1000 random maja ja 500 bussipeatuse klastrit dodgr sisendiks sobivasse formaati
+```{r}
+majad_tallinnas_dodgr <- majad_tallinnas_1000 %>% 
+  st_coordinates() %>% 
+  as.tibble()
+
+
+tallinna_peatused_dodgr <- tallinn_piiratud %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+Arvuta jalgsi distants Tallinna random 1000-st majast 500 bussipeatuse klastrini.
+```{r}
+system.time(
+  distants_tallinn_maja_peatus <- dodgr_dists(tallinna_teed_foot_weight, 
+                                          from = majad_tallinnas_dodgr, 
+                                          to = tallinna_peatused_dodgr)
+)
+```
+
+
+
+Leia igale majale lähima bussipeatuse kaugus
+```{r}
+min_distants_tallinn_maja_peatus <- distants_tallinn_maja_peatus %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+
+max(min_distants_tallinn_maja_peatus)
+```
+
+
+
+Leia lähima peatuse rea number, et selle järgi tuvastada juba nimi jm info
+```{r}
+lahim_peatus <- distants_tallinn_maja_peatus %>% 
+  as.tibble() %>% 
+  gather() %>% 
+  filter(value %in% min_distants_tallinn_maja_peatus)
+```
+
+
+Ühes tabelis koos igale majale lähima kino id ja vahemaa
+```{r}
+maja_peatus_vahemaa <- min_distants_tallinn_maja_peatus %>% 
+  as.tibble() %>% 
+  mutate(kust_id = row_number()) %>% 
+  left_join(lahim_peatus %>% mutate(key = as.numeric(key)), by = c("value")) %>% 
+  rename(kuhu_id = key,
+         vahemaa = value) %>% 
+  left_join(majad_tallinnas_1000 %>% 
+              as.tibble() %>% 
+              select(maja_aadress = aadress) %>% 
+              mutate(kust_id = row_number())) %>% 
+  left_join(tallinn_piiratud %>% 
+              as.tibble() %>% 
+              select(peatuse_nimi = stop_name) %>% 
+              mutate(kuhu_id = row_number()))
+
+maja_peatus_vahemaa %>% 
+  arrange(desc(vahemaa))
+```
+
+
+Kanna kaardile teekond majast peatusesse, kus vahemaa on kõige suurem
+```{r}
+path_maja_peatus <- dodgr_paths(tallinna_teed_foot_weight,
+                                    from = majad_tallinnas_dodgr %>% filter(row_number() == 896), 
+                                    to = tallinna_peatused_dodgr %>% filter(row_number() == 35))
+
+verts_tallinn <- dodgr_vertices(tallinna_teed_foot_weight)
+
+index_tallinn <- match(path_maja_peatus[[1]][[1]], verts_tallinn$id)
+
+path_maja_peatus_valik <- verts_tallinn[index_tallinn, ]
+
+path_maja_peatus_sf <- path_maja_peatus_valik %>%
+  select(x, y) %>% 
+  as.matrix() %>%
+  st_linestring() %>%
+  st_sfc(crs = 4326)
+
+mapview(path_maja_peatus_sf) %>% 
+  addFeatures(tallinn_piiratud %>% st_transform(crs = 4326))
+```
+
+
+# Teemakaart
+
+Lae Eesti asumite andmed, et koostada Tallinna piirides kaardivõrgustik
+Selle põhjal proovin teha heatmapi, mis näitab kaugust lähimast peatusest
+```{r}
+# lae Eesti asumite piiridega kaart
+# andmed pärit aadressilt: http://www.gadm.org/download
+eesti_asumid_raw <- read_rds("~/Dropbox/DataScience/R/hoonete_vanus/data/EST_adm3.rds")
+eesti_asumid <- st_as_sf(eesti_asumid_raw)
+
+tallinn_vorgustik <- eesti_asumid %>% 
+  filter(NAME_2 == "Tallinn") %>% 
+  st_make_grid(n = 100) %>% 
+  st_intersection(eesti_asumid %>% 
+                    filter(NAME_2 == "Tallinn"))
+
+tallinn_vorgustik_keskpunktid <- tallinn_vorgustik %>% 
+  st_centroid()
+
+mapview(tallinn_vorgustik_keskpunktid)
+```
+
+
+Muuda Tallinna kaardivorgustiku keskpunktide andmed dodgr sisendiks sobivasse formaati
+```{r}
+tallinna_vorgustik_dodgr <- tallinn_vorgustik_keskpunktid %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+Arvuta jalgsi distants Tallinna vorgustiku keskpunktidest 500 bussipeatuse klastrini.
+```{r}
+system.time(
+  distants_tallinn_vorgustik_peatus <- dodgr_dists(tallinna_teed_foot_weight, 
+                                          from = tallinna_vorgustik_dodgr, 
+                                          to = tallinna_peatused_dodgr)
+)
+```
+
+
+
+Leia igale võrgustiku keskpunktile lähima bussipeatuse kaugus
+```{r}
+min_distants_tallinn_vorgustik_peatus <- distants_tallinn_vorgustik_peatus %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+
+min_distants_tallinn_vorgustik_peatus
+```
+
+Lisa vahemaa lähima peatuseni võrgustiku algandmetele
+```{r}
+tallinna_vorgustik_vahemaaga <- tallinn_vorgustik %>% 
+  as.tibble() %>% 
+  st_as_sf() %>% 
+  mutate(vahemaa_peatuseni = min_distants_tallinn_vorgustik_peatus) %>% 
+  filter(vahemaa_peatuseni != Inf)
+  
+mapview(tallinna_vorgustik_vahemaaga, zcol = "vahemaa_peatuseni", alpha = 0, legend = TRUE)
+```
+
+Tee samasugune kaart Tallinna koolide ja lasteaedade kohta.
+Ruutudeks jagamisel ära kasuta eraldi asumite kaarti vaid Tallinn kokku, muidu lõikab osa ruute pooleks.

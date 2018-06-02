@@ -1,0 +1,47 @@
+---
+title: "Koolide ja lasteaedade asukohtade andmete laadimine"
+output: html_notebook
+---
+
+Lae andmed kogu Eesti koolivõrgu ja lasteaedade kohta. Koolide ja lasteaedade asukohtade algandmed on pärit kaardilt https://koolikaart.hm.ee/
+Selle lehe source dokumendist sain omakorda kaardil kuvatud andmekihi kml fail asukoha.
+```{r}
+library(tidyverse)
+library(sf)
+library(mapview)
+
+koolid_kml <- "https://koolikaart.hm.ee/kml_koolid.php"
+
+lasteaiad_kml <- "https://koolikaart.hm.ee/kml_koolid.php?t=2&tmp=20180517160545"
+```
+
+Lae kõigi koolide asukohad sf objektiks
+```{r}
+koolid_sf <- st_read(koolid_kml)
+
+lasteaiad_sf <- st_read(lasteaiad_kml)
+```
+
+Kanna koolid kaardile
+```{r}
+mapview(koolid_sf)
+```
+
+
+Kanna kaardile lasteaiad.
+Lasteaedade tabel sisaldab ka koolide tabelist ca 130 objekti. tegemist on kool-lasteaedadega.
+```{r}
+mapview(lasteaiad_sf)
+```
+
+
+
+Salvesta koolide sf fail
+```{r}
+saveRDS(koolid_sf, file = "data/koolid_sf.rds")
+```
+
+Salveste lasteaedade sf fail
+```{r}
+saveRDS(lasteaiad_sf, file = "data/lasteaiad_sf.rds")
+```

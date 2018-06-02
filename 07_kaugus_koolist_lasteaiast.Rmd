@@ -1,0 +1,374 @@
+---
+title: "Teekond kooli ja lasteaeda Tallinnas"
+output: html_notebook
+---
+
+Visualiseeri Tallinna asukohtade kaugus lähimast koolimajast ja lasteaiast.
+
+```{r setup}
+library(tidyverse)
+library(mapview)
+library(dodgr)
+library(sf)
+library(leaflet)
+library(leaflet.extras)
+library(htmlwidgets)
+library(webshot)
+
+# lae Eesti koolide andmed
+koolid_sf <- readRDS("data/koolid_sf.rds")
+
+# lae eesti lasteaedade andmed
+lasteaiad_sf <- readRDS("data/lasteaiad_sf.rds")
+
+# lae Eesti teede sf objekt, mille põhjal saab leida dodgr jaoks teekondade arvutamiseks vajaliku alustabeli
+eesti_teed_sf <- readRDS("data/eesti_teed_vaiksem_sf.rds")
+
+# lae eesti omavalitsuste andmed
+eesti_omavalitsused_raw <- st_read("data/omavalitsused/omavalitsus_20180501.shp")
+```
+
+## Tallinna aluskaart, kaardivõrgustik ja buffer
+
+Eralda Tallinna polügoniga andmestik. Eemalda ka Aegna saar ja muud eraldiseisvad polügonid.
+Andmestik on vajalik, et vaadata ainult Tallinna koole ja lasteaedu.
+```{r}
+tallinn_polygon <- eesti_omavalitsused_raw %>% 
+  filter(ONIMI == "Tallinn") %>% 
+  st_cast("POLYGON")
+
+polygon_pindala <- tallinn_polygon %>% 
+  st_area()
+
+tallinn_sf <- tallinn_polygon %>% 
+  mutate(pindala = as.numeric(polygon_pindala / 1000000)) %>% 
+  top_n(1, pindala) %>% 
+  st_simplify(dTolerance = 100)
+
+mapview(tallinn_sf)
+```
+
+
+Koosta Tallinna linna piires kaardivõrgustik, mille pealt omakorda arvutan kaugused lähima koolini ja lasteaiani.
+```{r}
+tallinn_vorgustik <- tallinn_sf %>% 
+  st_make_grid(n = 200) %>% 
+  st_intersection(tallinn_sf)
+
+tallinn_vorgustik_keskpunktid <- tallinn_vorgustik %>% 
+  st_centroid()
+```
+
+
+Muuda Tallinna kaardivorgustiku keskpunktide andmed dodgr sisendiks sobivasse formaati
+```{r}
+tallinna_vorgustik_dodgr <- tallinn_vorgustik_keskpunktid %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+Koosta Tallinna kohta buffer (raadius 10km), mille abil leian piirkonna kõik teed.
+```{r}
+tallinn_buffer <- tallinn_sf %>% 
+  st_centroid() %>% 
+  st_buffer(10000)
+```
+
+
+## Tallinna teed dodgr
+
+Koosta Tallinna teede kohta jalgsi kaalutud dodgr tabel
+```{r}
+# millised teed jäävad vähemalt osaliselt Tallinna buffri sisse?
+tallinna_teed <- st_intersects(eesti_teed_sf %>% 
+                                 st_transform(crs = st_crs(tallinn_sf)), 
+                               tallinn_buffer)
+
+# leia nende teede jrk number, et need kogu Eesti teede andmestikust nii eraldada, et teid pooleks ei lõika
+tallinna_teede_index <- tallinna_teed %>% 
+  as.matrix() %>% 
+  as.tibble() %>% 
+  mutate(index = row_number()) %>% 
+  filter(V1 == TRUE) %>% 
+  pull(index)
+
+tallinna_teed_sf <- eesti_teed_sf %>% 
+  filter(row_number() %in% tallinna_teede_index)
+
+# arvuta kaalutud dodgr objekt Tallinna piirkonna teede kohta
+tallinna_teed_foot_weight <- weight_streetnet(tallinna_teed_sf, wt_profile = "foot")
+```
+
+# Koolid
+
+Eralda Tallinnasse jäävad koolid ja tee neist dodgr objekt
+```{r}
+tallinna_koolid_sf <- st_intersection(koolid_sf %>% 
+                                        st_transform(crs = st_crs(tallinn_sf)), 
+                                      tallinn_sf)
+
+tallinna_koolid_dodgr <- tallinna_koolid_sf %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+Arvuta jalgsi distants Tallinna vorgustiku keskpunktidest kõigi Tallinna koolideni.
+```{r}
+system.time(
+  distants_tallinn_vorgustik_kool <- dodgr_dists(tallinna_teed_foot_weight, 
+                                          from = tallinna_vorgustik_dodgr, 
+                                          to = tallinna_koolid_dodgr)
+)
+```
+
+
+Leia igale võrgustiku keskpunktile lähima kooli kaugus
+```{r}
+min_distants_tallinn_vorgustik_kool <- distants_tallinn_vorgustik_kool %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+```
+
+
+Leia lähima kooli rea number ning selle järgi kooli nimi. See on vajalik, et lisada lähima kooli nimi ka lõpptulemusele. 
+```{r}
+lahim_kool <- distants_tallinn_vorgustik_kool %>% 
+  as.tibble() %>% 
+  gather() %>% 
+  filter(value %in% min_distants_tallinn_vorgustik_kool) %>% 
+  mutate(key = as.numeric(key)) %>% 
+  left_join(tallinna_koolid_sf %>% 
+              as.tibble() %>% 
+              select(kool = Name) %>% 
+              mutate(key = row_number())) %>% 
+  select(-key, vahemaa_koolini = value) %>% 
+  distinct(vahemaa_koolini, kool) %>% 
+  filter(vahemaa_koolini != 0)
+  
+```
+
+
+## Lasteaiad
+
+Eralda Tallinnasse jäävad lasteaiad ja tee neist dodgr objekt
+```{r}
+tallinna_lasteaiad_sf <- st_intersection(lasteaiad_sf %>% 
+                                           st_transform(crs = st_crs(tallinn_sf)), 
+                                         tallinn_sf)
+
+tallinna_lasteaiad_dodgr <- tallinna_lasteaiad_sf %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+Arvuta jalgsi distants Tallinna vorgustiku keskpunktidest kõigi Tallinna lasteaedadeni.
+```{r}
+system.time(
+  distants_tallinn_vorgustik_lasteaed <- dodgr_dists(tallinna_teed_foot_weight, 
+                                                    from = tallinna_vorgustik_dodgr, 
+                                                    to = tallinna_lasteaiad_dodgr)
+)
+```
+
+
+
+Leia igale võrgustiku keskpunktile lähima lasteaia kaugus
+```{r}
+min_distants_tallinn_vorgustik_lasteaed <- distants_tallinn_vorgustik_lasteaed %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+```
+
+
+Leia lähima lasteaia rea number ning selle järfi lasteaia nimi. See on vajalik, et lisada lähima lasteaia nimi ka lõpptulemusele. 
+```{r}
+lahim_lasteaed <- distants_tallinn_vorgustik_lasteaed %>% 
+  as.tibble() %>% 
+  gather() %>% 
+  filter(value %in% min_distants_tallinn_vorgustik_lasteaed) %>% 
+  mutate(key = as.numeric(key)) %>% 
+  left_join(tallinna_lasteaiad_sf %>% 
+              as.tibble() %>% 
+              select(lasteaed = Name) %>% 
+              mutate(key = row_number())) %>% 
+  select(-key, vahemaa_lasteaiani = value) %>% 
+  distinct(vahemaa_lasteaiani, lasteaed) %>% 
+  filter(vahemaa_lasteaiani != 0)
+  
+```
+
+
+# Tallinna lähim kool ja lasteaed kaardil
+
+Lisa vahemaa lähima koolini ja lasteaiani võrgustiku algandmetele
+```{r}
+tallinna_vorgustik_vahemaaga <- tallinn_vorgustik %>% 
+  as.tibble() %>% 
+  mutate(vahemaa_koolini = min_distants_tallinn_vorgustik_kool,
+         vahemaa_lasteaiani = min_distants_tallinn_vorgustik_lasteaed) %>% 
+  left_join(lahim_lasteaed,
+            by = "vahemaa_lasteaiani") %>% 
+  left_join(lahim_kool,
+            by = "vahemaa_koolini") %>% 
+  st_as_sf()
+
+```
+
+Kaardil kaugus igast ruudust lähima koolini
+```{r}
+# mapview(tallinna_vorgustik_vahemaaga %>% filter(vahemaa_koolini != Inf), 
+#         zcol = "vahemaa_koolini", 
+#         alpha = 0, 
+#         legend = TRUE) +
+#   mapview(tallinna_koolid_sf, color = "red", alpha.regions = 0)
+```
+
+
+Kaardil kaugus igast ruudust lähima lasteaiani
+```{r}
+# mapview(tallinna_vorgustik_vahemaaga %>% filter(vahemaa_lasteaiani != Inf), 
+#         zcol = "vahemaa_lasteaiani", 
+#         alpha = 0, 
+#         legend = TRUE) +
+#   mapview(tallinna_lasteaiad_sf, color = "red", alpha.regions = 0)
+```
+
+Koosta kaart koolide kohta.
+```{r}
+# eemalda ruudud, kuhu vahemaad ei õnnestunud leida ja muuda projektsioon leafletile sobivaks
+tallinna_koolid_data <- tallinna_vorgustik_vahemaaga %>% 
+  filter(vahemaa_koolini != Inf) %>% 
+  st_transform(crs = 4326) %>% 
+  mutate(popup = str_c(round(vahemaa_koolini, 1), " km,  ", kool))
+
+# muuda projektsioon leafletile sobivaks
+tallinna_koolid_parandus <- tallinna_koolid_sf %>% 
+  st_transform(crs = 4326)
+  
+
+# värvipalett
+pal_koolid <- colorNumeric(palette = "viridis",
+                           domain = tallinna_koolid_data$vahemaa_koolini)
+
+# kaardil kaardiruudustiku kaugus lähimast koolist
+tallinna_koolid_kaardil <- leaflet(tallinna_koolid_data) %>% 
+  addProviderTiles(providers$CartoDB.DarkMatterNoLabels, group = "CartoDB.DarkMatterNoLabels") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Esri.WorldImagery") %>%
+  addProviderTiles(providers$OpenStreetMap.BlackAndWhite, group = "OpenStreetMap.BlackAndWhite") %>%
+  addProviderTiles(providers$OpenMapSurfer.Grayscale, group = "OpenMapSurfer.Grayscale") %>%
+  addProviderTiles(providers$Hydda.Base, group = "Hydda.Base") %>%
+  addProviderTiles(providers$Stamen.TonerBackground, group = "Stamen.TonerBackground") %>%
+  addProviderTiles(providers$CartoDB.PositronNoLabels, group = "CartoDB.PositronNoLabels") %>%
+  addPolygons(stroke = FALSE,
+              fillColor = ~pal_koolid(tallinna_koolid_data$vahemaa_koolini),
+              fillOpacity = 0.7,
+              smoothFactor = 0.5,
+              label = ~popup) %>% 
+  addCircles(data = tallinna_koolid_parandus,
+             color = "red",
+             popup = ~Name,
+             radius = 15,
+             group = "koolid") %>% 
+  addLayersControl(
+    baseGroups = c("CartoDB.DarkMatterNoLabels", "Esri.WorldImagery", "OpenStreetMap.BlackAndWhite",
+                   "OpenMapSurfer.Grayscale", "Hydda.Base", "Stamen.TonerBackground",
+                   "CartoDB.PositronNoLabels"),
+    overlayGroups = c("koolid"),
+    options = layersControlOptions(collapsed = TRUE)) %>% 
+  # hideGroup("koolid") %>% 
+  addLegend("bottomright", pal = pal_koolid, values = ~vahemaa_koolini,
+    title = "Teekond kooli",
+    labFormat = labelFormat(suffix = " km"),
+    opacity = 1
+  ) %>% 
+  addSearchOSM() %>%  # võimalus otsida asukohta kaardilt
+  addResetMapButton()  # taasta esialgne vaade
+
+tallinna_koolid_kaardil
+```
+
+
+Koosta kaart lasteaedade kohta.
+```{r}
+# eemalda ruudud, kuhu vahemaad ei õnnestunud leida ja muuda projektsioon leafletile sobivaks
+tallinna_lasteaiad_data <- tallinna_vorgustik_vahemaaga %>% 
+  filter(vahemaa_lasteaiani != Inf) %>% 
+  st_transform(crs = 4326) %>% 
+  mutate(popup = str_c(round(vahemaa_lasteaiani, 1), " km,  ", lasteaed))
+
+# muuda projektsioon leafletile sobivaks
+tallinna_lasteaiad_parandus <- tallinna_lasteaiad_sf %>% 
+  st_transform(crs = 4326)
+  
+
+# värvipalett
+pal_lasteaiad <- colorNumeric(palette = "viridis",
+                              domain = tallinna_lasteaiad_data$vahemaa_lasteaiani)
+
+# kaardil kaardiruudustiku kaugus lähimast lasteaiast
+tallinna_lasteaiad_kaardil <- leaflet(tallinna_lasteaiad_data) %>% 
+  addProviderTiles(providers$CartoDB.DarkMatterNoLabels, group = "CartoDB.DarkMatterNoLabels") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Esri.WorldImagery") %>%
+  addProviderTiles(providers$OpenStreetMap.BlackAndWhite, group = "OpenStreetMap.BlackAndWhite") %>%
+  addProviderTiles(providers$OpenMapSurfer.Grayscale, group = "OpenMapSurfer.Grayscale") %>%
+  addProviderTiles(providers$Hydda.Base, group = "Hydda.Base") %>%
+  addProviderTiles(providers$Stamen.TonerBackground, group = "Stamen.TonerBackground") %>%
+  addProviderTiles(providers$CartoDB.PositronNoLabels, group = "CartoDB.PositronNoLabels") %>%
+  addPolygons(stroke = FALSE,
+              fillColor = ~pal_lasteaiad(tallinna_lasteaiad_data$vahemaa_lasteaiani),
+              fillOpacity = 0.7,
+              smoothFactor = 0.5,
+              label = ~popup) %>% 
+  addCircles(data = tallinna_lasteaiad_parandus,
+             color = "red",
+             popup = ~Name,
+             radius = 15,
+             group = "lasteaiad") %>% 
+  addLayersControl(
+    baseGroups = c("CartoDB.DarkMatterNoLabels", "Esri.WorldImagery", "OpenStreetMap.BlackAndWhite",
+                   "OpenMapSurfer.Grayscale", "Hydda.Base", "Stamen.TonerBackground",
+                   "CartoDB.PositronNoLabels"),
+    overlayGroups = c("lasteaiad"),
+    options = layersControlOptions(collapsed = TRUE)) %>% 
+  # hideGroup("lasteaiad") %>% 
+  addLegend("bottomright", pal = pal_lasteaiad, values = ~vahemaa_lasteaiani,
+    title = "Teekond lasteaeda",
+    labFormat = labelFormat(suffix = " km"),
+    opacity = 1
+  ) %>% 
+  addSearchOSM() %>%  # võimalus otsida asukohta kaardilt
+  addResetMapButton()  # taasta esialgne vaade
+
+tallinna_lasteaiad_kaardil
+```
+
+Salvesta interaktiivne kaart Tallinna koolide kaugusest blogis kasutamiseks
+```{r}
+saveWidget(tallinna_koolid_kaardil, 
+           file = "teekond_kooli.html", 
+           selfcontained = TRUE,
+           title = "Teekond kooli")
+```
+
+
+Salvesta interaktiivne kaart Tallinna lasteaedade kaugusest blogis kasutamiseks
+```{r}
+saveWidget(tallinna_lasteaiad_kaardil, 
+           file = "teekond_lasteaeda.html", 
+           selfcontained = TRUE,
+           title = "Teekond lasteaeda")
+```
+
+
+Salvesta kaartidest pildid blogis viitamiseks
+```{r}
+webshot(c("teekond_kooli.html", "teekond_lasteaeda.html"), 
+        file = c("output/teekond-kooli.png", "output/teekond-lasteaeda.png"),
+        cliprect = "viewport",
+        vwidth = 1200,
+        vheight = 900,
+        delay = 1)
+```

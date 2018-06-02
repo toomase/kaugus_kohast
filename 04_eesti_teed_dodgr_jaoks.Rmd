@@ -1,0 +1,179 @@
+---
+title: "Eesti teed - dodgr weighted"
+output: html_notebook
+---
+
+Tee kõigist Eesti teedest dodgr paketi jaoks sobivas formaadis kaalutud tabelid, mille põhjal saab arvutada punktide vahelist teepikkust ning joonistada välja teerajad.
+
+```{r}
+library(tidyverse)
+library(sf)
+library(osmdata)
+library(mapview)
+library(dodgr)
+
+
+# Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+# Lae lihtsustatud maakondade piirid
+maakonnad_simp_raw <- readRDS("data/maakonnad_simp.RDS")
+```
+
+Jäta maakondade piiridest välja väiksed saared.
+See on vajalik, et mitte tuvastada teest kaugete punktidena saartel asuvaid kohti.
+```{r}
+# eraldia multipolygon eraldi polygon-ideks, st iga polügon on eraldi rida tabelis 
+maakonnad_polygon_raw <- st_cast(maakonnad_simp_raw, "POLYGON") 
+
+# iga polügoni suurus m2
+maakonnad_polygon_m2 <- st_area(maakonnad_polygon_raw)
+
+# jäta alles ainult üle 1000km2 polügonid
+maakonnad_simp <- maakonnad_polygon_raw %>% 
+  mutate(ala_km2 = round(as.numeric(maakonnad_polygon_m2) / 1000000, 1)) %>% 
+  filter(ala_km2 > 1000)
+
+mapview(maakonnad_simp)
+```
+
+
+
+Jaga maakonnad veel eraldi ruutudeks. Nende ruutude kaupa on siis võimalik teedevõrgustiku andmed pärida.
+```{r}
+# kogu Eesti territoorium 10 x 10 ruutudeks 
+eesti_10_x_10 <- st_make_grid(maakonnad_simp, n = 10)
+
+# ruudud ainult mandri osas 4326 projektsiooniga
+maakonnad_vorgustik <- st_intersection(eesti_10_x_10, st_union(maakonnad_simp)) %>% 
+  as.tibble() %>%
+  st_as_sf() %>%
+  st_transform(crs = 4326)
+```
+
+Funktsioon, mis muudab rida haaval objektid polygonideks. Vajalik, et multipolygonidest lahti saada.
+```{r}
+tee_polygon <- function(x){
+  maakonnad_vorgustik[x, ] %>% 
+    st_cast("POLYGON")
+}
+```
+
+Töötle multipolygonid polygonideks, mis on sf objektis eraldi ridadel.
+```{r}
+# tee kõigi tabeli ridade kohta polygonid ja multipolygon jaga eraldi ridadel polygonideks
+polygonid_list <- map(seq(1, nrow(maakonnad_vorgustik)), tee_polygon)
+
+# muuda list üheks sf objektiks kokku
+polygonid_sf <- reduce(polygonid_list, rbind)
+
+# tee maakonna plolygonidest koorinaatide nested data frame. See on vajalik OSM andmete pärimiseks
+maakonnad_koordinaadi_nested <- polygonid_sf %>% 
+  st_coordinates() %>% 
+  as.tibble() %>% 
+  dplyr::select('1' = X, '2' = Y, grupp = L2) %>%
+  nest('1', '2')
+
+# muuda data frame listiks, mis sisaldab iga ruudu kohta matrixi
+maakonnad_koordinaadi_matrix <- map(maakonnad_koordinaadi_nested$data, as.matrix)
+```
+
+Funktsioon, mis pärib OSM teede andmed valitud ruudu kohta
+```{r}
+pari_teed <- function(x){
+  osmdata::opq (x) %>%
+    osmdata::add_osm_feature (key = "highway") %>%
+    osmdata::osmdata_sf (quiet = FALSE) %>%
+    osmdata::osm_poly2line () %>% 
+    .$osm_lines
+}
+```
+
+
+Päri kõigi teede andmed
+```{r}
+eesti_teed_raw <- map(maakonnad_koordinaadi_matrix, pari_teed)
+```
+
+Pane teede andmed ühte tabelisse kokku
+```{r}
+eesti_teed_sf <- reduce(eesti_teed_raw, bind_rows)
+```
+
+Eemalda väga suur list, mida rohkem pole vaja
+```{r}
+rm(eesti_teed_raw)
+```
+
+Päri dodgr paketiga teedevõrgu andmed, et tuvastada veerud, mida on vaja
+```{r}
+streetnet <- dodgr_streetnet ("hampi india", expand = 0)
+```
+
+Kustuta kordused ja jäta alles ainult vajalikud veerud
+```{r}
+eesti_teed_toodeldud_sf <- eesti_teed_sf %>%
+  as.tibble() %>% 
+  select(names(streetnet %>% select(-name.kn))) %>%
+  arrange(osm_id) %>% 
+  distinct(osm_id, .keep_all = TRUE) %>% 
+  st_as_sf(crs = 4326) %>% 
+  st_transform(crs = 4326)
+```
+
+
+Eemalda üleliigsete veergudega tabel
+```{r}
+rm(eesti_teed_sf)
+```
+
+
+Salvesta teede andmed
+```{r}
+# saveRDS(eesti_teed_toodeldud_sf, file = "data/eesti_teed_sf.rds")
+```
+
+Lae teede andmed
+```{r}
+# eesti_teed_toodeldud_sf <- readRDS("data/eesti_teed_sf.rds")
+```
+
+Eemalda ebavajalikud veerud teede sf objektist, et mahtu vähendada ja arvutusi kiiremaks teha.
+```{r}
+# eesti_teed_vaiksem_sf <- eesti_teed_toodeldud_sf %>% 
+#   select(osm_id, highway, oneway, geometry)
+```
+
+Salvesta vähendatud veergude arvuga eesti teede objekt edasiseks kasutamiseks
+```{r}
+# saveRDS(eesti_teed_vaiksem_sf, file = "data/eesti_teed_vaiksem_sf.rds")
+```
+
+Lae Eesti teede sf objekt, kust ebavajalikud veerud on eemaldatud
+```{r}
+eesti_teed_vaiksem_sf <- readRDS("data/eesti_teed_vaiksem_sf.rds")
+```
+
+
+Tee kaalutud teedevõrgu objekt, mida dodgr paketi abil teekondade planeerimisel kasutada (auto põhine).
+```{r}
+system.time(
+  eesti_teed_motorcar_weight <- weight_streetnet(eesti_teed_vaiksem_sf, wt_profile = "motorcar")
+)
+```
+
+Tee kaalutud teedevõrgu objekt, mida dodgr paketi abil teekondade planeerimisel kasutada (jala käimise põhine).
+```{r}
+system.time(
+  eesti_teed_foot_weight <- weight_streetnet(eesti_teed_vaiksem_sf, wt_profile = "foot")
+)
+```
+
+
+Salvesta kaalutud teedevõrgu objektid
+```{r}
+saveRDS(eesti_teed_motorcar_weight, file = "data/eesti_teed_motorcar_weight.rds")
+
+saveRDS(eesti_teed_foot_weight, file = "data/eesti_teed_foot_weight.rds")
+```
+

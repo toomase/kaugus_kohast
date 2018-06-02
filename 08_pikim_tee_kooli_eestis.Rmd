@@ -1,0 +1,8 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Joonista Eesti kohta kaardivõrgustik või kasuta perifeeri töös olnud kaardivõrgustikku.
+Vali igast ruudust üks random hoone aadressregistrist ning arvuta iga ruudu hoone keskpunkti kohta kaugus lähimast koolist või lasteaiast. Seejärel vali n ruutu, kus objekt on kõige kaugemal ning leia nende ruutude sees kõigi hoonete kohta lähima kooli või lasteaia kaugus.
+Kanna kaardile top 10 hoonet, mis asuvad koolist/lasteaiast kõige kaugemal. Joonista kaardile ka teekond kooli ning kuva kooli asukoht plinkiva ikooniga leaflet.extra paketist.
