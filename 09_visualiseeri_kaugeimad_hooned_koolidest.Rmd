@@ -1,0 +1,205 @@
+---
+title: "Visualiseeri pikim tee kooli Eestis"
+output: html_notebook
+---
+
+```{r}
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(leaflet.extras)
+library(dodgr)
+library(mapview)
+library(opencage)
+library(htmlwidgets)
+library(webshot)
+
+# Lae andmed hoonete kohta, mis asuvad analüüsi põhjal lähimast koolist max kaugel
+kaugeimad_hooned_koolidest <- readRDS("data/kaugeimad_hooned_koolidest.rds")
+
+# Lae motorcar põhine Eesti teede alusandmestik
+eesti_teed_motorcar_weight <- readRDS("data/eesti_teed_motorcar_weight.rds")
+
+# lae Eesti koolide andmed
+koolid_sf <- readRDS("data/koolid_sf.rds")
+
+# Eesti asustusüksused Maaameti lehelt, et nende põhjal tuvastada üldine aadress kus mingi hoone asub.
+asustusyksus_sf <- st_read("data/asustusyksus/asustusyksus_20180601.shp")
+```
+
+Koosta kaks andmetabelit, mis sisaldavad õiges järjekorras hoonet ja lähimat kooli
+```{r}
+hooned_from <- kaugeimad_hooned_koolidest %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble() 
+  
+koolid_to <- kaugeimad_hooned_koolidest %>% 
+  as.data.frame() %>% 
+  select(kool) %>% 
+  left_join(koolid_sf, by = c("kool" = "Name")) %>% 
+  st_as_sf() %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+Ettevalmistused teekondadde joonistamiseks
+```{r}
+verts <- dodgr_vertices(eesti_teed_motorcar_weight)
+```
+
+
+Arvuta teekonad kõigi kaugete hoonete ja koolide vahel
+```{r}
+system.time(
+  path_hoone_kool <- dodgr_paths(eesti_teed_motorcar_weight,
+                                 from = hooned_from, 
+                                 to = koolid_to)
+)
+```
+
+Funktsioon, mis teeb dodgr list objektist sf linestring objekti
+```{r}
+joonista_tee <- function(x){
+  
+  # kuna from ja to tabelid vastavad üksteisele, siis on soovitud lühim tee vastavalt listi [[3]][[3]] jne objekt
+  # vali dogr teekond ja lisa sellel vertices koordinaadid
+  path_hoone_kool[[x]][[x]] %>%
+    as.tibble() %>% 
+    inner_join(verts, by = c("value" = "id")) %>% 
+    select(x, y) %>% 
+    as.matrix() %>%
+    st_linestring() 
+}
+```
+
+Joonista teekond kõigi hoonete ja koolide vahel ja pane see ühte listi kokku
+```{r}
+teekonnad_list <- map(seq(1, length(path_hoone_kool)), joonista_tee)
+```
+
+Pane ühte sf objekti kokku kõik teekonnad ja info lähima kooli kohta
+```{r}
+teekonnad_sf <- teekonnad_list %>% 
+  st_sfc(crs = 4326) %>% 
+  st_sf() %>% 
+  mutate(lahim_kool = kaugeimad_hooned_koolidest$kool,
+         vahemaa_koolini = kaugeimad_hooned_koolidest$vahemaa_koolini)
+```
+
+Kanna kaardile pikimad teekonnad, kaugeimad hooned, sihtpunktiks olevad koolid ja kõik ülejäänud koolid Eestis (väiksemalt)
+```{r}
+mapview(teekonnad_sf) +
+  mapview(kaugeimad_hooned_koolidest, zcol = "vahemaa_koolini") +
+  mapview(koolid_sf, alpha.regions = 0, color = "grey") +
+  mapview(koolid_sf %>% filter(Name %in% kaugeimad_hooned_koolidest$kool), alpha.regions = 0, color = "red")
+```
+
+Tuleta kaugeimate hoonete kooridnaatidest nende aadressid, et seda kaardil kuvada.
+Kasuta selleks geokodeerimist
+NB! Kuna aadressid ei ole mõistlikus formaadis, siis seda ei kasuta
+```{r}
+# lae salvestatud API key opencage teenuse kohta (2500 päringut päevas)
+source("R/opencage_key.R")
+
+# funktsioon, mis eraldab ainult koordinaatidest aadressi
+geokodeeri_aadress <- function(x, y){
+  aadressid_algsed <- opencage_reverse(y, x, key = opencage_key, limit = 1)
+  
+  as.character(aadressid_algsed$results$formatted)
+}
+
+# päri kõik aadressid ühte vektorisse
+aadressid_raw <- map2_chr(hooned_from$X, hooned_from$Y, 
+                      geokodeeri_aadress)
+
+aadressid_raw
+```
+
+Valmista andmed ette kaardile kandmiseks
+```{r}
+teekonnad_data <- teekonnad_sf %>% 
+  mutate(label = str_c(round(vahemaa_koolini, 1), " km"))
+
+kaugeimad_hooned_data <- kaugeimad_hooned_koolidest %>% 
+  st_join(asustusyksus_sf) %>%  # lisa igale hoonele aadressi tunnused
+  st_transform(crs = 4326) %>% 
+  mutate(aadress = str_c(ANIMI, ONIMI, sep = ", "))
+
+koolid_valitud_data <- koolid_sf %>% 
+  filter(Name %in% kaugeimad_hooned_koolidest$kool)
+```
+
+
+Kaardil hooned, millest asuvad koolid maksimaalselt kaugel.
+```{r}
+# värvipalett
+pal_hooned_kooli <- colorNumeric(palette = "viridis",
+                                 domain = kaugeimad_hooned_data$vahemaa_koolini)
+
+# labelis kuvamiseks aadress, kooli nimi ja kaugus html fomatiga
+labs <- pmap(list(kaugeimad_hooned_data$aadress, as.character(kaugeimad_hooned_data$kool),
+                  kaugeimad_hooned_data$vahemaa_koolini), 
+             function(adr, kool, km){
+               str_c("Asukoht: <b>", adr, "</b><br>", 
+                     "Lähim kool: <b>", kool, "</b><br>", 
+                     "Kaugus: <b>", round(km, 1), " km</b>")
+})
+
+# kaardil pikimad teekonnad koolini
+teekond_koolini_kaardil <- leaflet(teekonnad_data) %>% 
+  addProviderTiles(providers$CartoDB.PositronNoLabels, group = "CartoDB.PositronNoLabels") %>%
+  addProviderTiles(providers$CartoDB.DarkMatterNoLabels, group = "CartoDB.DarkMatterNoLabels") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Esri.WorldImagery") %>%
+  addProviderTiles(providers$OpenStreetMap.BlackAndWhite, group = "OpenStreetMap.BlackAndWhite") %>%
+  addProviderTiles(providers$OpenMapSurfer.Grayscale, group = "OpenMapSurfer.Grayscale") %>%
+  addProviderTiles(providers$Hydda.Base, group = "Hydda.Base") %>%
+  addProviderTiles(providers$Stamen.TonerBackground, group = "Stamen.TonerBackground") %>%
+  addPolylines(weight = 2,
+               label = ~label) %>% 
+  addCircleMarkers(data = kaugeimad_hooned_data,
+                   color = ~pal_hooned_kooli(kaugeimad_hooned_data$vahemaa_koolini),
+                   radius = 7,
+                   stroke = FALSE,
+                   fillOpacity = 0.7,
+                   label = map(labs, htmltools::HTML)) %>%  # formati label HTML-na
+  addCircleMarkers(data = koolid_valitud_data,
+                   color = "red",
+                   stroke = FALSE,
+                   radius = 5,
+                   fillOpacity = 0.7,
+                   label = ~Name) %>% 
+  addCircleMarkers(data = koolid_sf,
+                   radius = 4,
+                   stroke = FALSE,
+                   fillOpacity = 0.3,
+                   label = ~Name,
+                   color = "grey",
+                   group = "Kõik koolid") %>% 
+  addLayersControl(
+    baseGroups = c("CartoDB.PositronNoLabels", "CartoDB.DarkMatterNoLabels", "Esri.WorldImagery", 
+                   "OpenStreetMap.BlackAndWhite", "OpenMapSurfer.Grayscale", "Hydda.Base", 
+                   "Stamen.TonerBackground"),
+    overlayGroups = c("Kõik koolid"),
+    options = layersControlOptions(collapsed = TRUE)) %>% 
+  hideGroup("lasteaiad") %>%
+  addLegend("bottomright", pal = pal_hooned_kooli, values = ~vahemaa_koolini,
+    title = "Kooli kaugus",
+    labFormat = labelFormat(suffix = " km"),
+    opacity = 0.7
+  ) %>% 
+  addSearchOSM() %>%  # võimalus otsida asukohta kaardilt
+  addResetMapButton()  # taasta esialgne vaade
+
+teekond_koolini_kaardil
+```
+
+
+Salvesta interaktiivne kaart blogis kasutamiseks
+```{r}
+saveWidget(teekond_koolini_kaardil, 
+                        file = "pikim_tee_kooli.html", 
+                        selfcontained = TRUE,
+                        title = "Pikim tee kooli")
+```

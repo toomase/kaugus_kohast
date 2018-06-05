@@ -6,3 +6,330 @@ output: html_notebook
 Joonista Eesti kohta kaardivõrgustik või kasuta perifeeri töös olnud kaardivõrgustikku.
 Vali igast ruudust üks random hoone aadressregistrist ning arvuta iga ruudu hoone keskpunkti kohta kaugus lähimast koolist või lasteaiast. Seejärel vali n ruutu, kus objekt on kõige kaugemal ning leia nende ruutude sees kõigi hoonete kohta lähima kooli või lasteaia kaugus.
 Kanna kaardile top 10 hoonet, mis asuvad koolist/lasteaiast kõige kaugemal. Joonista kaardile ka teekond kooli ning kuva kooli asukoht plinkiva ikooniga leaflet.extra paketist.
+
+```{r}
+library(sf)
+library(tidyverse)
+library(mapview)
+library(dodgr)
+
+# lae Eesti koolide andmed
+koolid_sf <- readRDS("data/koolid_sf.rds")
+
+# Lae lihtsustatud maakondade piirid
+maakonnad_simp_raw <- readRDS("data/maakonnad_simp.RDS")
+
+# Eesti kaardivõrgustik 2 km2 ruutudega Maaameti kodulehelt. Selle abil saab pärida igast ruudust ühe random hoone koordinaadid.
+kaardivorgustik_raw <- st_read("data/kaardivorgustik/epk2T.shp")
+
+# Lae kõik Eesti hooned OSM andmetest
+hooned_raw <- st_read("data/hooned/gis.osm_buildings_a_free_1.shp")
+
+# Lae Eesti omavalitsuste andmed. See on vajalik, et välistada Tallinn, Tartu jm suured tiheasustusega linnad, kus on väga palju maju, aga kindlasti pole kooli või lasteaia teekond kõige pikem.
+eesti_omavalitsused_raw <- st_read("data/omavalitsused/omavalitsus_20180501.shp")
+
+# Lae motorcar põhine Eesti teede alusandmestik
+eesti_teed_motorcar_weight <- readRDS("data/eesti_teed_motorcar_weight.rds")
+```
+
+Jäta maakondade piiridest välja väiksed saared.
+See on vajalik, et mitte tuvastada teest kaugete punktidena saartel asuvaid kohti.
+```{r}
+# eraldia multipolygon eraldi polygon-ideks, st iga polügon on eraldi rida tabelis 
+maakonnad_polygon_raw <- st_cast(maakonnad_simp_raw, "POLYGON") 
+
+# iga polügoni suurus m2
+maakonnad_polygon_m2 <- st_area(maakonnad_polygon_raw)
+
+# jäta alles ainult üle 1000km2 polügonid
+maakonnad_simp <- maakonnad_polygon_raw %>% 
+  mutate(ala_km2 = round(as.numeric(maakonnad_polygon_m2) / 1000000, 1)) %>% 
+  filter(ala_km2 > 1000)
+```
+
+Ainult need koolid, mis asuvad mandril või suurtel saartel
+```{r}
+koolid_mandril <- st_intersection(koolid_sf %>% st_transform(crs = st_crs(maakonnad_simp)), 
+                                  maakonnad_simp)
+```
+
+Ainult need kaardivõrgustiku ruudud, mis asuvad vähemalt osaliselt mandril või suurtel saartel.
+```{r}
+kaardivorgustik_mandril <- kaardivorgustik_raw %>% 
+  filter(lengths(st_intersects(., maakonnad_simp)) > 0)
+```
+
+
+Eesti omavalitsused, kust on välistatud paar suurlinna, et jätta analüüsist seal asuvad hooned välja
+```{r}
+kov_suurlinnadeta <- eesti_omavalitsused_raw %>% 
+  filter(!ONIMI %in% c("Tartu linn", "Tallinn", "Narva linn")) %>% 
+  st_simplify(dTolerance = 100) %>% 
+  st_transform(crs = st_crs(maakonnad_simp))
+```
+
+Hoonete keskpunktid
+```{r}
+hooned_keskpunkt <- hooned_raw %>% 
+  select(osm_id) %>% 
+  st_centroid() %>% 
+  st_transform(crs = st_crs(maakonnad_simp))
+```
+
+
+Eesti maakonnad, mis on mandril ja suurlinnades ja kust on välistatud paar suurlinna.
+```{r}
+# kov_toodeldud <- maakonnad_simp %>% 
+#   st_union() %>% 
+#   st_intersection(kov_suurlinnadeta %>% 
+#                     st_union()) %>% 
+#   rmapshaper::ms_simplify(keep = 0.1,
+#                           keep_shapes = TRUE)
+# 
+# saveRDS(kov_toodeldud, "data/kov_suurlinnadeta.rds")
+```
+
+Lae eesti piirid ilma väikesaarte ja suurlinnadeta
+```{r}
+kov_toodeldud <- readRDS("data/kov_suurlinnadeta.rds")
+```
+
+
+Ainult need hooned, mis on mandril ja mis pole suurlinnades
+```{r}
+hooned_toodeldud <- hooned_keskpunkt %>% 
+  filter(lengths(st_intersects(., kov_toodeldud)) > 0)
+```
+Lisa igale hoonele juurde info kaardivõrgustiku kohta, mille ruutu ta langeb. See on vajalik, et valida igast ruudust 1 random hoone kauguse arvutamiseks.
+```{r}
+hooned_kaardivorgustikuga <- hooned_toodeldud %>% 
+  st_join(kaardivorgustik_mandril %>% select(NR)) %>% 
+  rename(kaardivorgustiku_nr = NR)
+```
+
+Vali random hoone igast kaardivõrgustiku ruudust
+```{r}
+set.seed(3)
+
+hooned_random_valik <- hooned_kaardivorgustikuga %>% 
+  group_by(kaardivorgustiku_nr) %>% 
+  sample_n(1) %>% 
+  ungroup()
+```
+
+
+Muuda random hoonete andmed dodgr sisendiks sobivasse formaati
+```{r}
+hooned_dodgr <- hooned_random_valik %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+# Koolid
+
+Tee koolidest dodgr objekt
+```{r}
+koolid_dodgr <- koolid_mandril %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+Arvuta autosõidu distants igast Eesti kaardivõrgustik ühest hoonest kõigi Eesti koolideni.
+See võttis aega 22214.252 (ca 6H)
+```{r}
+# system.time(
+#   distants_hooned_kool <- dodgr_dists(eesti_teed_motorcar_weight, 
+#                                       from = hooned_dodgr,
+#                                       to = koolid_dodgr)
+# )
+```
+
+Salvesta distants igast ruudu majast igasse kooli, et mitte seda väga suurt arvutust (ca 6H) korrata ilma asjata.
+```{r}
+# saveRDS(distants_hooned_kool, file = "data/distants_hooned_kool.rds")
+```
+
+Lae distants igast ruudu majast igasse kooli.
+```{r}
+distants_hooned_kool <- readRDS("data/distants_hooned_kool.rds")
+```
+
+errorid:
+[2018-06-04 00:43:49] [error] handle_read_frame error: websocketpp.transport:7 (End of File)
+[2018-06-04 00:43:49] [fatal] handle_write_frame error: websocketpp.transport:10 (A transport action was requested after shutdown)
+
+
+Leia igale random hoonele lähima kooli kaugus
+```{r}
+min_distants_hooned_kool <- distants_hooned_kool %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+```
+
+
+Leia lähima kooli rea number ning selle järgi kooli nimi. See on vajalik, et lisada lähima kooli nimi ka lõpptulemusele. 
+```{r}
+lahim_kool <- distants_hooned_kool %>% 
+  as.tibble() %>% 
+  gather() %>% 
+  filter(value %in% min_distants_hooned_kool) %>% 
+  mutate(key = as.numeric(key)) %>% 
+  left_join(koolid_mandril %>% 
+              as.tibble() %>% 
+              select(kool = Name) %>% 
+              mutate(key = row_number())) %>% 
+  select(-key, vahemaa_koolini = value) %>% 
+  distinct(vahemaa_koolini, kool) %>% 
+  filter(vahemaa_koolini != 0)
+  
+```
+
+Lisa vahemaa lähima koolini random hoonete algandmetele
+```{r}
+random_hooned_vahemaaga <- hooned_random_valik %>% 
+  as.tibble() %>% 
+  mutate(vahemaa_koolini = min_distants_hooned_kool) %>% 
+  left_join(lahim_kool,
+            by = "vahemaa_koolini") %>% 
+  st_as_sf() %>% 
+  filter(!vahemaa_koolini %in% c(Inf, 0))
+```
+
+
+Leia top 500 punkti, mis on koolist kõige kaugemal. Seejärel klasterda need punktid, et tuvastada grupid, kus need punktid paiknevad. Igast grupist saan siis omakorda leida kõige kaugema punkti.
+```{r}
+# vali 500 kõige kaugemat hoonet
+top_500_random_hoonet <- random_hooned_vahemaaga %>% 
+  top_n(500, vahemaa_koolini) 
+
+# tuvasta nende hoonete grupid
+kaugus_clust <- top_500_random_hoonet %>%
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble() %>% 
+  dbscan::hdbscan(minPts = 5)
+```
+
+```{r}
+mapview(top_500_random_hoonet)
+```
+
+
+Grupeeri varem leitud klastrid kokku ja leia igast klastrist kõige kaugem punkt teedest.
+```{r}
+top_kaugemad_hooned <- top_500_random_hoonet %>% 
+  mutate(cluster = kaugus_clust$cluster) %>%  # lisa klastri number (0 on ilma klastrita)
+  arrange(cluster, desc(vahemaa_koolini)) %>% 
+  filter(cluster != 0) %>% 
+  group_by(cluster) %>% 
+  filter(vahemaa_koolini == max(vahemaa_koolini)) %>% 
+  ungroup() %>% 
+  arrange(desc(vahemaa_koolini))
+
+mapview(top_kaugemad_hooned, zcol = "cluster")
+```
+
+
+
+Vali kõik hooned nendest kaardivõrgustiku ruutudest, mis on koolist kõige kaugemal
+```{r}
+kaardivorgustiku_nr_kaugeim <- top_kaugemad_hooned %>% 
+  pull(kaardivorgustiku_nr)
+
+hooned_kaugeimatest_ruutudest <- hooned_kaardivorgustikuga %>% 
+  filter(kaardivorgustiku_nr %in% kaardivorgustiku_nr_kaugeim)
+```
+
+Muuda kaugeimate hoonete andmed dodgr sisendiks sobivasse formaati
+```{r}
+hooned_kaugeimatest_ruutudest_dodgr <- hooned_kaugeimatest_ruutudest %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+Vali ainult need koolid, mis on kaugeimatele ruutudele kõige lähemal
+```{r}
+koolid_kaugeimad <- top_kaugemad_hooned %>% 
+  as.data.frame() %>% 
+  mutate(kool = as.character(kool)) %>% 
+  distinct(kool) %>% 
+  pull(kool)
+
+koolid_kaugeimad_sf <- koolid_mandril %>% 
+  filter(Name %in% koolid_kaugeimad)
+```
+
+Tee kaugeimatest koolidest dodgr objekt
+```{r}
+koolid_kaugeimad_dodgr <- koolid_kaugeimad_sf %>% 
+  st_transform(crs = 4326) %>% 
+  st_coordinates() %>% 
+  as.tibble()
+```
+
+
+Arvuta autosõidu distants koolidest kõige kaugemal olevatest kaardivõrgu ruutude kõigist hoonetest.
+```{r}
+system.time(
+  distants_koik_hooned_kool <- dodgr_dists(eesti_teed_motorcar_weight,
+                                      from = hooned_kaugeimatest_ruutudest_dodgr,
+                                      to = koolid_kaugeimad_dodgr)
+)
+```
+
+Leia igale hoonele lähima kooli kaugus
+```{r}
+min_distants_koik_hooned_kool <- distants_koik_hooned_kool %>% 
+  matrixStats::rowMins(na.rm = TRUE)
+```
+
+
+Leia lähima kooli rea number ning selle järgi kooli nimi. See on vajalik, et lisada lähima kooli nimi ka lõpptulemusele. 
+```{r}
+kaugeima_lahim_kool <- distants_koik_hooned_kool %>% 
+  as.tibble() %>% 
+  gather() %>% 
+  filter(value %in% min_distants_koik_hooned_kool) %>% 
+  mutate(key = as.numeric(key)) %>% 
+  left_join(koolid_kaugeimad_sf %>% 
+              as.tibble() %>% 
+              select(kool = Name) %>% 
+              mutate(key = row_number())) %>% 
+  select(-key, vahemaa_koolini = value) %>% 
+  distinct(vahemaa_koolini, kool) %>% 
+  filter(vahemaa_koolini != 0)
+  
+```
+
+Lisa vahemaa lähima koolini kaugeimate ruhutude algandmetele
+```{r}
+kaugeimad_hooned_vahemaaga <- hooned_kaugeimatest_ruutudest %>% 
+  as.tibble() %>% 
+  mutate(vahemaa_koolini = min_distants_koik_hooned_kool) %>% 
+  left_join(kaugeima_lahim_kool,
+            by = "vahemaa_koolini") %>% 
+  st_as_sf() %>% 
+  filter(!vahemaa_koolini %in% c(Inf, 0))
+```
+
+Vali igast kaardiruudust koolist kõige kaugem hoone. Kui kaugus on mõnel hoonel sama, sisi võta random hoone nende hulgast.
+```{r}
+set.seed(1)
+
+kaugeimad_hooned_koolidest <- kaugeimad_hooned_vahemaaga %>% 
+  group_by(kaardivorgustiku_nr) %>% 
+  filter(vahemaa_koolini == max(vahemaa_koolini)) %>% 
+  sample_n(1)
+
+mapview(kaugeimad_hooned_koolidest, zcol = "vahemaa_koolini")
+```
+
+Salvesta andmed hoonete kohta, mis on koolidest kõige kaugemal
+```{r}
+saveRDS(kaugeimad_hooned_koolidest, file = "data/kaugeimad_hooned_koolidest.rds")
+```
+
